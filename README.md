@@ -460,46 +460,6 @@ message decides the bump):
 That switches to major bumps once `1.0.0` is reached — controlled by
 `bump-minor-pre-major` in the release-please config.)
 
-### Terraform Registry
-
-The public Terraform Registry watches the GitHub repo and ingests every
-new `vX.Y.Z` tag automatically — there is no separate "publish" step.
-**One-time setup:**
-
-1. Sign in at <https://registry.terraform.io> with the `KamranBiglari`
-   GitHub account.
-2. *Publish module* → select `terraform-aws-alternat-pro`.
-3. The repo name `terraform-<provider>-<name>` is required by the
-   registry — this repo is named `terraform-aws-alternat-pro` so it
-   maps to provider `aws`, name `alternat-pro`.
-
-After that, every release-please tag becomes a registry version, and
-consumers can pin via:
-
-```hcl
-module "alternat" {
-  source  = "KamranBiglari/alternat-pro/aws"
-  version = "~> 1.0"
-  ...
-}
-```
-
-(Until the registry is connected, `source = "github.com/KamranBiglari/terraform-aws-alternat-pro?ref=vX.Y.Z"`
-also works.)
-
-### Local checks before pushing
-
-```sh
-terraform fmt -recursive
-terraform init -backend=false && terraform validate
-for ex in simple with-nat-gateway-fallback with-transit-gateway-fallback complete; do
-  ( cd examples/$ex && terraform init -backend=false && terraform validate )
-done
-tflint --init && tflint --recursive
-```
-
-[release-please]: https://github.com/googleapis/release-please-action
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
