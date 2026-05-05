@@ -1,0 +1,533 @@
+{
+  "Comment": "alternat health-check / force-fallback / force-ec2 orchestrator. All AWS API calls happen in the SFN service plane so the in-VPC probe Lambda needs zero VPC endpoints to function.",
+  "StartAt": "ResolveAZs",
+  "States": {
+    "ResolveAZs": {
+      "Type": "Pass",
+      "Parameters": {
+        "action.$": "$.action",
+        "az_filter.$": "$.az",
+        "azs": ${jsonencode(azs)}
+      },
+      "Next": "PerAZ"
+    },
+    "PerAZ": {
+      "Type": "Map",
+      "ItemsPath": "$.azs",
+      "MaxConcurrency": ${max_concurrency},
+      "ItemSelector": {
+        "action.$": "$.action",
+        "az_filter.$": "$.az_filter",
+        "az.$": "$$.Map.Item.Value.az",
+        "asg_name.$": "$$.Map.Item.Value.asg_name",
+        "route_table_ids.$": "$$.Map.Item.Value.route_table_ids",
+        "test_urls.$": "$$.Map.Item.Value.test_urls",
+        "fallback_kind.$": "$$.Map.Item.Value.fallback_kind",
+        "fallback_target_id.$": "$$.Map.Item.Value.fallback_target_id",
+        "probe_arn.$": "$$.Map.Item.Value.probe_arn"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "FilterAZ",
+        "States": {
+          "FilterAZ": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Or": [
+                  { "Variable": "$.az_filter", "StringEquals": "all" },
+                  { "Variable": "$.az_filter", "StringEqualsPath": "$.az" }
+                ],
+                "Next": "GetLockState"
+              }
+            ],
+            "Default": "Skipped"
+          },
+
+          "GetLockState": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:getItem",
+            "Parameters": {
+              "TableName": "${lock_table_name}",
+              "Key": { "az": { "S.$": "$.az" } },
+              "ConsistentRead": true
+            },
+            "ResultPath": "$.lock_raw",
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "DefaultLock", "ResultPath": null }],
+            "Next": "ResolveLock"
+          },
+
+          "ResolveLock": {
+            "Type": "Choice",
+            "Choices": [
+              { "Variable": "$.lock_raw.Item", "IsPresent": true, "Next": "ExtractLock" }
+            ],
+            "Default": "DefaultLock"
+          },
+
+          "ExtractLock": {
+            "Type": "Pass",
+            "Parameters": {
+              "cooldown_until.$": "$.lock_raw.Item.cooldown_until.N",
+              "last_target.$": "$.lock_raw.Item.last_target.S"
+            },
+            "ResultPath": "$.lock",
+            "Next": "DescribeRouteTables"
+          },
+
+          "DefaultLock": {
+            "Type": "Pass",
+            "Parameters": {
+              "cooldown_until": "0",
+              "last_target": null
+            },
+            "ResultPath": "$.lock",
+            "Next": "DescribeRouteTables"
+          },
+
+          "DescribeRouteTables": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:describeRouteTables",
+            "Parameters": {
+              "RouteTableIds.$": "$.route_table_ids"
+            },
+            "ResultPath": "$.rts",
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "DataFetchFailed", "ResultPath": "$.error" }],
+            "Next": "FindLiveEni"
+          },
+
+          "FindLiveEni": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:describeNetworkInterfaces",
+            "Parameters": {
+              "Filters": [
+                { "Name": "tag:alternat-az",          "Values.$": "States.Array($.az)" },
+                { "Name": "tag:alternat-name-prefix", "Values": ["${name_prefix}"] },
+                { "Name": "status",                   "Values": ["in-use"] }
+              ]
+            },
+            "ResultPath": "$.eni_lookup",
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "DataFetchFailed", "ResultPath": "$.error" }],
+            "Next": "EniFoundChoice"
+          },
+
+          "EniFoundChoice": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.eni_lookup.NetworkInterfaces[0]",
+                "IsPresent": true,
+                "Next": "ExtractEni"
+              }
+            ],
+            "Default": "SetEniNull"
+          },
+
+          "ExtractEni": {
+            "Type": "Pass",
+            "Parameters": {
+              "eni_id.$": "$.eni_lookup.NetworkInterfaces[0].NetworkInterfaceId"
+            },
+            "ResultPath": "$.eni",
+            "Next": "InvokeProbe"
+          },
+
+          "SetEniNull": {
+            "Type": "Pass",
+            "Parameters": { "eni_id": null },
+            "ResultPath": "$.eni",
+            "Next": "InvokeProbe"
+          },
+
+          "InvokeProbe": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName.$": "$.probe_arn",
+              "Payload": {
+                "az.$": "$.az",
+                "test_urls.$": "$.test_urls",
+                "timeout_seconds": ${probe_timeout_seconds},
+                "live_eni_id.$": "$.eni.eni_id",
+                "route_tables.$": "$.rts.RouteTables",
+                "expected_fallback_kind.$": "$.fallback_kind",
+                "expected_fallback_target_id.$": "$.fallback_target_id",
+                "lock.$": "$.lock",
+                "cooldown_seconds": ${cooldown_seconds}
+              }
+            },
+            "ResultPath": "$.probe",
+            "ResultSelector": {
+              "Payload.$": "$.Payload"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "Next": "ProbeFailed", "ResultPath": "$.error" }
+            ],
+            "Next": "DecideAction"
+          },
+
+          "DataFetchFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "data_fetch_error",
+              "error.$": "$.error"
+            },
+            "End": true
+          },
+
+          "ProbeFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "probe_failed",
+              "error.$": "$.error"
+            },
+            "End": true
+          },
+
+          "DecideAction": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.action",
+                "StringEquals": "force-fallback",
+                "Next": "WriteFallback"
+              },
+              {
+                "Variable": "$.action",
+                "StringEquals": "force-ec2",
+                "Next": "CheckCanRestoreEc2"
+              },
+              {
+                "Variable": "$.probe.Payload.cooldown_active",
+                "BooleanEquals": true,
+                "Next": "InCooldown"
+              },
+              {
+                "Variable": "$.probe.Payload.healthy",
+                "BooleanEquals": false,
+                "Next": "WriteFallback"
+              },
+              {
+                "And": [
+                  { "Variable": "$.probe.Payload.healthy", "BooleanEquals": true },
+                  { "Variable": "$.probe.Payload.current_target", "StringEquals": "ec2" }
+                ],
+                "Next": "NoOp"
+              }%{ if enable_auto_restore },
+              {
+                "Variable": "$.probe.Payload.healthy",
+                "BooleanEquals": true,
+                "Next": "CheckCanRestoreEc2"
+              }%{ endif }
+            ],
+            "Default": "NoOp"
+          },
+
+          "CheckCanRestoreEc2": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.probe.Payload.ec2_eni_id",
+                "IsNull": true,
+                "Next": "NoEniAvailable"
+              },
+              {
+                "Variable": "$.probe.Payload.ec2_eni_id",
+                "IsPresent": true,
+%{ if enable_ssm_verify ~}
+                "Next": "SsmGate"
+%{ else ~}
+                "Next": "WriteEc2"
+%{ endif ~}
+              }
+            ],
+            "Default": "NoEniAvailable"
+          },
+
+%{ if enable_ssm_verify ~}
+          "SsmGate": {
+            "Type": "Choice",
+            "Choices": [
+              { "Variable": "$.action", "StringEquals": "force-ec2", "Next": "WriteEc2" }
+            ],
+            "Default": "SsmSendVerify"
+          },
+
+          "SsmSendVerify": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+            "Parameters": {
+              "DocumentName": "${ssm_document_name}",
+              "Comment": "alternat verify NAT instance before route restore",
+              "TimeoutSeconds": 30,
+              "Targets": [
+                { "Key": "tag:alternat-az",          "Values.$": "States.Array($.az)" },
+                { "Key": "tag:alternat-name-prefix", "Values": ["${name_prefix}"] }
+              ]
+            },
+            "ResultPath": "$.ssm",
+            "ResultSelector": { "CommandId.$": "$.Command.CommandId" },
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "SsmVerifyDeferred", "ResultPath": "$.error" }],
+            "Next": "SsmWait"
+          },
+
+          "SsmWait": {
+            "Type": "Wait",
+            "Seconds": ${ssm_verify_wait_seconds},
+            "Next": "SsmGetResult"
+          },
+
+          "SsmGetResult": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:listCommandInvocations",
+            "Parameters": {
+              "CommandId.$": "$.ssm.CommandId",
+              "Details": true
+            },
+            "ResultPath": "$.ssm_result",
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 2, "MaxAttempts": 2, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "SsmVerifyDeferred", "ResultPath": "$.error" }],
+            "Next": "SsmHasInvocation"
+          },
+
+          "SsmHasInvocation": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.ssm_result.CommandInvocations[0]",
+                "IsPresent": true,
+                "Next": "SsmEvalResult"
+              }
+            ],
+            "Default": "SsmVerifyDeferred"
+          },
+
+          "SsmEvalResult": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.ssm_result.CommandInvocations[0].Status",
+                "StringEquals": "Success",
+                "Next": "WriteEc2"
+              }
+            ],
+            "Default": "SsmVerifyDeferred"
+          },
+
+          "SsmVerifyDeferred": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "ssm_verify_failed_or_pending"
+            },
+            "End": true
+          },
+%{ endif ~}
+
+          "NoEniAvailable": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "no_live_ec2_eni"
+            },
+            "End": true
+          },
+
+          "WriteFallback": {
+            "Type": "Map",
+            "ItemsPath": "$.route_table_ids",
+            "ItemSelector": {
+              "rt.$": "$$.Map.Item.Value",
+              "fallback_kind.$": "$.fallback_kind",
+              "fallback_target_id.$": "$.fallback_target_id"
+            },
+            "ItemProcessor": {
+              "ProcessorConfig": { "Mode": "INLINE" },
+              "StartAt": "FallbackKindRouter",
+              "States": {
+                "FallbackKindRouter": {
+                  "Type": "Choice",
+                  "Choices": [
+                    { "Variable": "$.fallback_kind", "StringEquals": "nat_gateway", "Next": "ReplaceWithNatGateway" },
+                    { "Variable": "$.fallback_kind", "StringEquals": "existing_nat_gateway", "Next": "ReplaceWithNatGateway" },
+                    { "Variable": "$.fallback_kind", "StringEquals": "transit_gateway", "Next": "ReplaceWithTransitGateway" },
+                    { "Variable": "$.fallback_kind", "StringEquals": "network_interface", "Next": "ReplaceWithEni" },
+                    { "Variable": "$.fallback_kind", "StringEquals": "none", "Next": "FallbackNone" }
+                  ],
+                  "Default": "FallbackNone"
+                },
+                "ReplaceWithNatGateway": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+                  "Parameters": {
+                    "RouteTableId.$": "$.rt",
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "NatGatewayId.$": "$.fallback_target_id"
+                  },
+                  "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+                  "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailed", "ResultPath": "$.error" }],
+                  "End": true
+                },
+                "ReplaceWithTransitGateway": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+                  "Parameters": {
+                    "RouteTableId.$": "$.rt",
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "TransitGatewayId.$": "$.fallback_target_id"
+                  },
+                  "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+                  "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailed", "ResultPath": "$.error" }],
+                  "End": true
+                },
+                "ReplaceWithEni": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+                  "Parameters": {
+                    "RouteTableId.$": "$.rt",
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "NetworkInterfaceId.$": "$.fallback_target_id"
+                  },
+                  "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+                  "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailed", "ResultPath": "$.error" }],
+                  "End": true
+                },
+                "FallbackNone": {
+                  "Type": "Pass",
+                  "Parameters": { "rt.$": "$.rt", "skipped": true, "reason": "fallback_kind_none" },
+                  "End": true
+                },
+                "RouteWriteFailed": {
+                  "Type": "Pass",
+                  "Parameters": { "rt.$": "$.rt", "failed": true, "reason": "route_write_error", "error.$": "$.error" },
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": "$.write_result",
+            "Next": "RecordTransitionFallback"
+          },
+
+          "WriteEc2": {
+            "Type": "Map",
+            "ItemsPath": "$.route_table_ids",
+            "ItemSelector": {
+              "rt.$": "$$.Map.Item.Value",
+              "eni.$": "$.probe.Payload.ec2_eni_id"
+            },
+            "ItemProcessor": {
+              "ProcessorConfig": { "Mode": "INLINE" },
+              "StartAt": "ReplaceWithEc2Eni",
+              "States": {
+                "ReplaceWithEc2Eni": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+                  "Parameters": {
+                    "RouteTableId.$": "$.rt",
+                    "DestinationCidrBlock": "0.0.0.0/0",
+                    "NetworkInterfaceId.$": "$.eni"
+                  },
+                  "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+                  "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailedEc2", "ResultPath": "$.error" }],
+                  "End": true
+                },
+                "RouteWriteFailedEc2": {
+                  "Type": "Pass",
+                  "Parameters": { "rt.$": "$.rt", "failed": true, "reason": "route_write_error", "error.$": "$.error" },
+                  "End": true
+                }
+              }
+            },
+            "ResultPath": "$.write_result",
+            "Next": "RecordTransitionEc2"
+          },
+
+          "RecordTransitionFallback": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "${lock_table_name}",
+              "Key": { "az": { "S.$": "$.az" } },
+              "UpdateExpression": "SET cooldown_until = :until, last_target = :tgt, last_changed_at = :iso, ttl_at = :ttl",
+              "ExpressionAttributeValues": {
+                ":until": { "N.$": "States.Format('{}', $.probe.Payload.new_cooldown_until)" },
+                ":tgt":   { "S": "fallback" },
+                ":iso":   { "S.$": "$$.State.EnteredTime" },
+                ":ttl":   { "N.$": "States.Format('{}', States.MathAdd($.probe.Payload.now_epoch, 86400))" }
+              }
+            },
+            "ResultPath": null,
+            "End": true
+          },
+
+          "RecordTransitionEc2": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "${lock_table_name}",
+              "Key": { "az": { "S.$": "$.az" } },
+              "UpdateExpression": "SET cooldown_until = :until, last_target = :tgt, last_changed_at = :iso, ttl_at = :ttl",
+              "ExpressionAttributeValues": {
+                ":until": { "N.$": "States.Format('{}', $.probe.Payload.new_cooldown_until)" },
+                ":tgt":   { "S": "ec2" },
+                ":iso":   { "S.$": "$$.State.EnteredTime" },
+                ":ttl":   { "N.$": "States.Format('{}', States.MathAdd($.probe.Payload.now_epoch, 86400))" }
+              }
+            },
+            "ResultPath": null,
+            "End": true
+          },
+
+          "InCooldown": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "cooldown_active"
+            },
+            "End": true
+          },
+
+          "NoOp": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "no_action_needed"
+            },
+            "End": true
+          },
+
+          "Skipped": {
+            "Type": "Pass",
+            "Parameters": {
+              "az.$": "$.az",
+              "skipped": true,
+              "reason": "az_filter_mismatch"
+            },
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

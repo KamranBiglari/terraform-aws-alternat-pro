@@ -1,0 +1,96 @@
+{
+  "Comment": "alternat ASG lifecycle handler — flips route to fallback target when an instance terminates",
+  "StartAt": "WriteFallback",
+  "States": {
+    "WriteFallback": {
+      "Type": "Map",
+      "ItemsPath": "$.route_table_ids",
+      "ItemSelector": {
+        "rt.$": "$$.Map.Item.Value",
+        "fallback_kind.$": "$.fallback_kind",
+        "fallback_target_id.$": "$.fallback_target_id"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "FallbackKindRouter",
+        "States": {
+          "FallbackKindRouter": {
+            "Type": "Choice",
+            "Choices": [
+              { "Variable": "$.fallback_kind", "StringEquals": "nat_gateway", "Next": "ReplaceWithNatGateway" },
+              { "Variable": "$.fallback_kind", "StringEquals": "existing_nat_gateway", "Next": "ReplaceWithNatGateway" },
+              { "Variable": "$.fallback_kind", "StringEquals": "transit_gateway", "Next": "ReplaceWithTransitGateway" },
+              { "Variable": "$.fallback_kind", "StringEquals": "network_interface", "Next": "ReplaceWithEni" },
+              { "Variable": "$.fallback_kind", "StringEquals": "none", "Next": "FallbackNone" }
+            ],
+            "Default": "FallbackNone"
+          },
+          "ReplaceWithNatGateway": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+            "Parameters": {
+              "RouteTableId.$": "$.rt",
+              "DestinationCidrBlock": "0.0.0.0/0",
+              "NatGatewayId.$": "$.fallback_target_id"
+            },
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailed", "ResultPath": "$.error" }],
+            "End": true
+          },
+          "ReplaceWithTransitGateway": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+            "Parameters": {
+              "RouteTableId.$": "$.rt",
+              "DestinationCidrBlock": "0.0.0.0/0",
+              "TransitGatewayId.$": "$.fallback_target_id"
+            },
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailed", "ResultPath": "$.error" }],
+            "End": true
+          },
+          "ReplaceWithEni": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ec2:replaceRoute",
+            "Parameters": {
+              "RouteTableId.$": "$.rt",
+              "DestinationCidrBlock": "0.0.0.0/0",
+              "NetworkInterfaceId.$": "$.fallback_target_id"
+            },
+            "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 3, "BackoffRate": 2.0 }],
+            "Catch":  [{ "ErrorEquals": ["States.ALL"], "Next": "RouteWriteFailed", "ResultPath": "$.error" }],
+            "End": true
+          },
+          "FallbackNone": {
+            "Type": "Pass",
+            "Parameters": { "rt.$": "$.rt", "skipped": true, "reason": "fallback_kind_none" },
+            "End": true
+          },
+          "RouteWriteFailed": {
+            "Type": "Pass",
+            "Parameters": { "rt.$": "$.rt", "failed": true, "reason": "route_write_error", "error.$": "$.error" },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.write_result",
+      "Next": "RecordTransition"
+    },
+    "RecordTransition": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${lock_table_name}",
+        "Key": { "az": { "S.$": "$.az" } },
+        "UpdateExpression": "SET last_target = :tgt, last_changed_at = :iso, ttl_at = if_not_exists(ttl_at, :zero)",
+        "ExpressionAttributeValues": {
+          ":tgt":  { "S": "fallback" },
+          ":iso":  { "S.$": "$$.State.EnteredTime" },
+          ":zero": { "N": "0" }
+        }
+      },
+      "ResultPath": null,
+      "End": true
+    }
+  }
+}

@@ -1,0 +1,100 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Logging
+exec > >(tee -a /var/log/alternat-bootstrap.log | logger -t alternat -s 2>/dev/console) 2>&1
+echo "alternat: bootstrap starting at $(date -u +%FT%TZ)"
+
+retry() {
+  # retry <max> <delay-seconds> <command...>
+  local max=$1; shift
+  local delay=$1; shift
+  local n=1
+  until "$@"; do
+    if [ "$n" -ge "$max" ]; then
+      echo "alternat: command failed after $n attempts: $*" >&2
+      return 1
+    fi
+    echo "alternat: attempt $n/$max failed for '$*'; sleeping $delay s"
+    sleep "$delay"
+    n=$((n+1))
+    delay=$((delay*2))
+  done
+}
+
+# Install awscli + iptables-services if not present (AL2023 has dnf, awscli2 in repos)
+retry 5 5 dnf install -y --quiet awscli iptables-services || true
+
+# Enable IPv4 forwarding
+cat <<'EOF' > /etc/sysctl.d/99-alternat.conf
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.send_redirects = 0
+EOF
+sysctl -p /etc/sysctl.d/99-alternat.conf
+
+# Discover the primary interface and its CIDR
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+PRIMARY_MAC=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
+PRIMARY_IF=$(ip -o link | awk -F': ' -v m="$PRIMARY_MAC" '$0 ~ m {print $2}' | cut -d'@' -f1 | head -1)
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+ENI_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" "http://169.254.169.254/latest/meta-data/network/interfaces/macs/$PRIMARY_MAC/interface-id")
+
+echo "alternat: instance=$INSTANCE_ID eni=$ENI_ID iface=$PRIMARY_IF region=${region}"
+
+# Disable source/dest check on this ENI so it can route packets it didn't originate
+retry 5 3 aws ec2 modify-instance-attribute \
+  --region "${region}" \
+  --instance-id "$INSTANCE_ID" \
+  --source-dest-check "{\"Value\": false}"
+
+# Tag the primary ENI so the Step Function can find the live NAT ENI by tag
+# without needing to call DescribeAutoScalingGroups + DescribeInstances.
+retry 5 3 aws ec2 create-tags \
+  --region "${region}" \
+  --resources "$ENI_ID" \
+  --tags "Key=alternat-az,Value=${az}" "Key=alternat-name-prefix,Value=${name_prefix}"
+
+# Configure iptables MASQUERADE
+iptables -t nat -F POSTROUTING || true
+iptables -t nat -A POSTROUTING -o "$PRIMARY_IF" -j MASQUERADE
+iptables -A FORWARD -i "$PRIMARY_IF" -j ACCEPT
+mkdir -p /etc/sysconfig
+iptables-save > /etc/sysconfig/iptables
+systemctl enable --now iptables || true
+
+# Claim the pre-allocated EIP, taking it from any other instance that may still hold it
+retry 5 3 aws ec2 associate-address \
+  --region "${region}" \
+  --instance-id "$INSTANCE_ID" \
+  --allocation-id "${eip_allocation_id}" \
+  --allow-reassociation
+
+%{ if write_route_on_boot ~}
+# Replace the default route in each owned route table to point at this ENI.
+# Wrap each in retry — transient throttling here would leave the AZ stuck on
+# the fallback target, defeating the purpose of having a NAT instance.
+%{ for rt_id in route_table_ids ~}
+if aws ec2 describe-route-tables --region "${region}" --route-table-ids "${rt_id}" \
+   --query 'RouteTables[0].Routes[?DestinationCidrBlock==`0.0.0.0/0`]' --output text | grep -q .; then
+  retry 5 3 aws ec2 replace-route --region "${region}" \
+    --route-table-id "${rt_id}" \
+    --destination-cidr-block "0.0.0.0/0" \
+    --network-interface-id "$ENI_ID"
+else
+  retry 5 3 aws ec2 create-route --region "${region}" \
+    --route-table-id "${rt_id}" \
+    --destination-cidr-block "0.0.0.0/0" \
+    --network-interface-id "$ENI_ID"
+fi
+%{ endfor ~}
+%{ else ~}
+# observation_mode = true — instance is NAT-ready but route tables are
+# untouched. Run the SSM Automation runbook with Action=force-ec2 to
+# write the route when ready.
+echo "alternat: observation_mode=true — skipping route-write step"
+%{ endif ~}
+
+echo "alternat: bootstrap complete at $(date -u +%FT%TZ)"
+
+# Caller-supplied extras
+${extra}

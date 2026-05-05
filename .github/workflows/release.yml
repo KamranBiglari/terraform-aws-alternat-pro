@@ -1,0 +1,42 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Conventional-commit-driven semantic versioning.
+# release-please opens / updates a "Release PR" on every push to main:
+#   - Reads commit messages since the last tag
+#   - Bumps the version in .release-please-manifest.json
+#   - Updates / creates CHANGELOG.md
+# When a maintainer merges that PR, release-please:
+#   - Creates a git tag (vX.Y.Z) on the merge commit
+#   - Publishes a GitHub Release with the changelog
+# The Terraform Registry watches the GitHub repo and ingests every new
+# v* tag automatically — no separate "publish" step is needed.
+#
+# Commit message conventions (subset of conventional-commits):
+#   feat: ...     -> minor bump
+#   fix:  ...     -> patch bump
+#   feat!: ... or
+#   <type>: ...
+#   BREAKING CHANGE: ...
+#                 -> major bump
+#   chore / docs / refactor / test / ci / build -> no version bump
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    steps:
+      - name: run release-please
+        uses: googleapis/release-please-action@v4
+        with:
+          config-file: .github/release-please-config.json
+          manifest-file: .github/.release-please-manifest.json
+          token: ${{ secrets.GITHUB_TOKEN }}
