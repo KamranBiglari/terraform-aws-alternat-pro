@@ -479,7 +479,7 @@ consumers can pin via:
 ```hcl
 module "alternat" {
   source  = "KamranBiglari/alternat-pro/aws"
-  version = "~> 1.0"
+  version = "~> 0.1"
   ...
 }
 ```
