@@ -13,8 +13,6 @@ locals {
       probe_arn          = aws_lambda_function.probe[m.az].arn
     }
   ]
-
-  sfn_az_records_by_az = { for r in local.sfn_az_records : r.az => r }
 }
 
 resource "aws_cloudwatch_log_group" "sfn_health" {

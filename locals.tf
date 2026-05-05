@@ -1,6 +1,5 @@
 locals {
   az_keys = [for m in var.vpc_az_maps : m.az]
-  az_map  = { for m in var.vpc_az_maps : m.az => m }
 
   azs_with_module_ngw = [for m in var.vpc_az_maps : m.az if m.create_nat_gateway]
 
