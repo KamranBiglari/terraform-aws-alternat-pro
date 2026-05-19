@@ -3,6 +3,14 @@ output "instance_eip_allocation_ids" {
   value       = local.eip_allocation_by_az
 }
 
+output "instance_eip_public_ips" {
+  description = "List of public IPs of module-created NAT instance EIPs. BYO EIPs are omitted (the caller already knows them)."
+  value = concat(
+    [for e in aws_eip.nat_instance_protected : e.public_ip],
+    [for e in aws_eip.nat_instance_unprotected : e.public_ip],
+  )
+}
+
 output "nat_gateway_ids" {
   description = "AZ -> NAT Gateway ID for module-managed NGWs."
   value       = { for az, n in aws_nat_gateway.this : az => n.id }
@@ -11,6 +19,11 @@ output "nat_gateway_ids" {
 output "nat_gateway_eip_allocation_ids" {
   description = "AZ -> EIP allocation ID consumed by module-managed NGWs."
   value       = local.ngw_eip_allocation_by_az
+}
+
+output "nat_gateway_public_ips" {
+  description = "List of public IPs of module-managed NAT Gateways."
+  value       = [for n in aws_nat_gateway.this : n.public_ip]
 }
 
 output "autoscaling_group_names" {
