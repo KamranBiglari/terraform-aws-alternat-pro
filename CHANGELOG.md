@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/KamranBiglari/terraform-aws-alternat-pro/compare/v0.1.1...v0.1.2) (2026-05-19)
+
+
+### Features
+
+* add list of public_ips to output ([15d5822](https://github.com/KamranBiglari/terraform-aws-alternat-pro/commit/15d582246fc5c0ed6ff9d94e3a4842979ad094e2))
+
 ## [0.1.1](https://github.com/KamranBiglari/terraform-aws-alternat-pro/compare/v0.1.0...v0.1.1) (2026-05-05)
 
 
