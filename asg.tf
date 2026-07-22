@@ -49,7 +49,7 @@ resource "aws_launch_template" "this" {
   }
 
   monitoring {
-    enabled = true
+    enabled = var.enable_detailed_monitoring
   }
 
   dynamic "block_device_mappings" {
@@ -87,15 +87,17 @@ resource "aws_launch_template" "this" {
   tag_specifications {
     resource_type = "instance"
     tags = merge(local.common_tags, {
-      Name = "${var.name_prefix}-${each.key}"
-      AZ   = each.key
+      Name            = "${var.name_prefix}-${each.key}"
+      AZ              = each.key
+      "alternat:role" = "nat-instance"
     })
   }
 
   tag_specifications {
     resource_type = "volume"
     tags = merge(local.common_tags, {
-      Name = "${var.name_prefix}-${each.key}"
+      Name            = "${var.name_prefix}-${each.key}"
+      "alternat:role" = "nat-instance-volume"
     })
   }
 
@@ -133,6 +135,12 @@ resource "aws_autoscaling_group" "this" {
   tag {
     key                 = "AZ"
     value               = each.key
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "alternat:role"
+    value               = "nat-instance"
     propagate_at_launch = true
   }
 

@@ -102,6 +102,20 @@ variable "nat_instance_block_devices" {
   default     = {}
 }
 
+variable "enable_detailed_monitoring" {
+  description = <<-EOT
+    When true (default), the NAT instances publish CloudWatch metrics at
+    1-minute granularity (detailed monitoring) instead of the default
+    5-minute basic monitoring. This covers the standard EC2 metrics —
+    CPUUtilization, NetworkIn/NetworkOut/NetworkPacketsIn/Out, etc. — which
+    you can visualize wherever you like. Note that guest memory is not a
+    standard EC2 metric and still requires the CloudWatch agent. Detailed
+    monitoring incurs a small per-instance CloudWatch cost.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "max_instance_lifetime" {
   description = "Maximum NAT instance age in seconds before the ASG terminates and replaces it."
   type        = number

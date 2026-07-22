@@ -62,9 +62,15 @@ locals {
   private_subnet_ids_by_az = { for m in var.vpc_az_maps : m.az => m.private_subnet_ids }
   public_subnet_id_by_az   = { for m in var.vpc_az_maps : m.az => m.public_subnet_id }
 
+  # Identity tags stamped on every resource so an alternat deployment is
+  # unambiguous to spot and filter. `alternat:managed` is a simple marker
+  # to select all module resources; `alternat:stack` disambiguates multiple
+  # alternat deployments in the same account/region (keyed on name_prefix).
   common_tags = merge(var.tags, {
-    Module    = "alternat"
-    ManagedBy = "terraform"
+    Module             = "alternat"
+    ManagedBy          = "terraform"
+    "alternat:managed" = "true"
+    "alternat:stack"   = var.name_prefix
   })
 
   resolved_ami_id = var.nat_ami_id != null ? var.nat_ami_id : data.aws_ssm_parameter.al2023_arm64[0].value
